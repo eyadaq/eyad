@@ -26,16 +26,20 @@
 #include <map>
 #include <poll.h>
 #include <netinet/in.h>
+#include <signal.h>
 
 #include "Request.hpp"
 #include "Response.hpp"
 #include "CgiHandler.hpp"
 #include "Client.hpp"
+#include "Config.hpp"
 
 class Server {
 private:
     std::vector<int>        _listen_fds;
     std::vector<pollfd>     _poll_fds;
+    std::vector<ServerConfig> _configs;
+    std::map<int, int>      _listener_ports;
     
     // Maps for tracking ownership
     std::map<int, Client*>  _clients;     // Key: socket_fd
@@ -44,6 +48,8 @@ private:
 public:
     Server();
     ~Server();
+
+    void    set_configs(const std::vector<ServerConfig> &configs);
 
     // Core Engine
     void    setup_server(int port);
@@ -59,6 +65,10 @@ public:
     bool    is_listener(int fd);
     void    process_request(Client &c);
     void    update_poll_events(int fd, short events);
+    const ServerConfig& select_config(const Request &req, const Client &c) const;
+    void    cleanup();
 };
+
+extern volatile sig_atomic_t g_shutdown_requested;
 
 #endif

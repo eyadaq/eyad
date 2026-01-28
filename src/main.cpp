@@ -12,7 +12,11 @@
 
 #include "ConfigParser.hpp"
 #include "Server.hpp"
+#include <signal.h>
 
+static void handle_sigint(int) {
+    g_shutdown_requested = 1;
+}
 
 int main(int argc, char** argv) {
     std::string config_path = (argc == 2) ? argv[1] : "default.conf";
@@ -20,6 +24,9 @@ int main(int argc, char** argv) {
     try {
         std::vector<ServerConfig> configs = ConfigParser::parse(config_path);
         Server webserv;
+        webserv.set_configs(configs);
+
+        signal(SIGINT, handle_sigint);
 
         // Setup a listener for every config block
         for (size_t i = 0; i < configs.size(); ++i) {
