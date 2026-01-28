@@ -25,4 +25,6 @@ Client::Client(int socket_fd, int listen_port) :
         chunked(false),
         content_length(0),
         header_end(0),
-        chunk_parse_pos(0) {}
+        chunk_parse_pos(0),
+        max_body_size(0),
+        config_resolved(false) {}

@@ -11,6 +11,9 @@
 /* ************************************************************************** */
 
 
+#ifndef CONFIG_PARSER_HPP
+#define CONFIG_PARSER_HPP
+
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -23,3 +26,5 @@ public:
     static std::vector<ServerConfig> parse(const std::string& path);
 
 };
+
+#endif

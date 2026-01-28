@@ -66,6 +66,10 @@ public:
     void    process_request(Client &c);
     void    update_poll_events(int fd, short events);
     const ServerConfig& select_config(const Request &req, const Client &c) const;
+    RouteConfig select_route(const Request &req, const ServerConfig &config) const;
+    void    apply_timeout_check();
+    bool    is_method_allowed(const std::string &method, const RouteConfig &route) const;
+    bool    is_cgi_request(const std::string &path, const RouteConfig &route, const ServerConfig &config) const;
     void    cleanup();
 };
 

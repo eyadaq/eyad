@@ -25,6 +25,7 @@ private:
     std::string _headers;
     std::string _content_type;
     ServerConfig _config;
+    RouteConfig _route;
 
     void _build_error_page(int code, const std::string &message);
     void _build_autoindex(const std::string &full_path, const std::string &request_path);
@@ -32,7 +33,8 @@ private:
     bool _try_load_error_page(int code);
 
 public:
-    Response(const Request& req, const ServerConfig &config);
+    Response(const Request& req, const ServerConfig &config, const RouteConfig &route);
+    Response(int code, const std::string &message, const ServerConfig &config, const RouteConfig &route);
     ~Response() {}
 
     const std::string& get_raw_response() const { return _full_response; }
