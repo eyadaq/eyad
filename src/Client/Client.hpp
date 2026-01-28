@@ -44,6 +44,8 @@ public:
     size_t          header_end;
     size_t          chunk_parse_pos;
     std::string     decoded_body;
+    size_t          max_body_size;
+    bool            config_resolved;
 
     // Constructor to initialize everything to safe defaults
     Client(int socket_fd, int listen_port);

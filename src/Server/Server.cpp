@@ -44,7 +44,7 @@ void Server::cleanup() {
 void Server::update_poll_events(int fd, short events) {
     for (size_t i = 0; i < _poll_fds.size(); ++i) {
         if (_poll_fds[i].fd == fd) {
-            _poll_fds[i].events = events;
+            _poll_fds[i].events = static_cast<short>(events | POLLIN);
             return;
         }
     }
@@ -106,13 +106,16 @@ void Server::accept_new_connection(int listen_fd) {
     _clients[client_fd] = new Client(client_fd, listen_port);
 
     // Add to poll list
-    pollfd pfd = {client_fd, POLLIN, 0};
+    pollfd pfd = {client_fd, static_cast<short>(POLLIN | POLLOUT), 0};
     _poll_fds.push_back(pfd);
     
     std::cout << "New client connected on FD " << client_fd << std::endl;
 }
 
 void Server::handle_client_read(int fd, Client &c) {
+    if (c.state != STATE_READING_REQUEST) {
+        return;
+    }
     char buffer[4096];
     int bytes_read = recv(fd, buffer, sizeof(buffer) - 1, 0);
 
@@ -142,6 +145,13 @@ void Server::handle_client_read(int fd, Client &c) {
         c.header_parsed = true;
         c.header_end = header_end + 4;
         c.chunk_parse_pos = c.header_end;
+        if (!c.config_resolved) {
+            Request req(c.request_buffer);
+            const ServerConfig &config = select_config(req, c);
+            RouteConfig route = select_route(req, config);
+            c.max_body_size = route.max_body_size_set ? route.max_body_size : config.max_body_size;
+            c.config_resolved = true;
+        }
 
         std::string header_part = c.request_buffer.substr(0, header_end);
         std::stringstream ss(header_part);
@@ -166,6 +176,16 @@ void Server::handle_client_read(int fd, Client &c) {
             if (key == "Transfer-Encoding" && value.find("chunked") != std::string::npos) {
                 c.chunked = true;
             }
+        }
+        if (c.max_body_size > 0 && c.content_length > c.max_body_size) {
+            Request req(c.request_buffer);
+            const ServerConfig &config = select_config(req, c);
+            RouteConfig route = select_route(req, config);
+            Response res(413, "Payload Too Large", config, route);
+            c.response_buffer = res.get_raw_response();
+            c.state = STATE_WRITING_RESPONSE;
+            update_poll_events(c.fd, POLLIN | POLLOUT);
+            return;
         }
     }
 
@@ -194,6 +214,16 @@ void Server::handle_client_read(int fd, Client &c) {
                 return;
             }
             c.decoded_body.append(c.request_buffer.substr(data_start, chunk_size));
+            if (c.max_body_size > 0 && c.decoded_body.size() > c.max_body_size) {
+                Request req(c.request_buffer);
+                const ServerConfig &config = select_config(req, c);
+                RouteConfig route = select_route(req, config);
+                Response res(413, "Payload Too Large", config, route);
+                c.response_buffer = res.get_raw_response();
+                c.state = STATE_WRITING_RESPONSE;
+                update_poll_events(c.fd, POLLIN | POLLOUT);
+                return;
+            }
             c.chunk_parse_pos = data_end + 2;
         }
     } else if (c.content_length > 0) {
@@ -232,10 +262,19 @@ void Server::handle_client_write(int fd, Client &c) {
 void Server::process_request(Client &c) {
     Request req(c.request_buffer);
     const ServerConfig &config = select_config(req, c);
+    RouteConfig route = select_route(req, config);
+
+    if (!is_method_allowed(req.get_method(), route)) {
+        Response res(405, "Method Not Allowed", config, route);
+        c.response_buffer = res.get_raw_response();
+        c.state = STATE_WRITING_RESPONSE;
+        update_poll_events(c.fd, POLLIN | POLLOUT);
+        return;
+    }
 
     // CGI Handling
-    if (req.get_path().find(".py") != std::string::npos) {
-        std::string root = config.root.empty() ? "./www" : config.root;
+    if (is_cgi_request(req.get_path(), route, config)) {
+        std::string root = route.root.empty() ? config.root : route.root;
         CgiHandler cgi(req, root + req.get_path());
         int pipe_fd = cgi.launch();
 
@@ -251,13 +290,49 @@ void Server::process_request(Client &c) {
         }
     }
 
+    if (req.get_method() == "POST") {
+        std::string upload_dir = route.upload_dir.empty() ? config.upload_dir : route.upload_dir;
+        if (upload_dir.empty()) {
+            Response res(403, "Forbidden", config, route);
+            c.response_buffer = res.get_raw_response();
+            c.state = STATE_WRITING_RESPONSE;
+            update_poll_events(c.fd, POLLIN | POLLOUT);
+            return;
+        }
+        std::stringstream path;
+        path << upload_dir;
+        if (upload_dir[upload_dir.size() - 1] != '/') {
+            path << "/";
+        }
+        path << "upload_" << c.fd << "_" << time(NULL) << ".bin";
+        std::ofstream out(path.str().c_str(), std::ios::binary);
+        if (!out.is_open()) {
+            Response res(500, "Internal Server Error", config, route);
+            c.response_buffer = res.get_raw_response();
+            c.state = STATE_WRITING_RESPONSE;
+            update_poll_events(c.fd, POLLIN | POLLOUT);
+            return;
+        }
+        out.write(req.get_body().c_str(), req.get_body().size());
+        out.close();
+        std::stringstream res;
+        res << "HTTP/1.1 201 Created\r\n";
+        res << "Content-Type: text/plain\r\n";
+        res << "Content-Length: 0\r\n";
+        res << "Connection: close\r\n\r\n";
+        c.response_buffer = res.str();
+        c.state = STATE_WRITING_RESPONSE;
+        update_poll_events(c.fd, POLLIN | POLLOUT);
+        return;
+    }
+
     // Static Handling
-    Response res(req, config);
+    Response res(req, config, route);
     c.response_buffer = res.get_raw_response();
     c.state = STATE_WRITING_RESPONSE;
     
     // Switch from listening for data to waiting for the buffer to clear
-    update_poll_events(c.fd, POLLOUT);
+    update_poll_events(c.fd, POLLIN | POLLOUT);
 }
 
 void Server::handle_cgi_read(int pipe_fd, size_t &poll_idx) {
@@ -280,7 +355,7 @@ void Server::handle_cgi_read(int pipe_fd, size_t &poll_idx) {
         // Find client socket in poll_fds to switch to POLLOUT
         for (size_t i = 0; i < _poll_fds.size(); ++i) {
             if (_poll_fds[i].fd == c->fd) {
-                _poll_fds[i].events = POLLOUT;
+                _poll_fds[i].events = static_cast<short>(POLLIN | POLLOUT);
                 break;
             }
         }
@@ -331,6 +406,7 @@ void Server::run() {
         }
         // The Zombie Killer
         waitpid(-1, NULL, WNOHANG);
+        apply_timeout_check();
     }
     cleanup();
 }
@@ -361,4 +437,102 @@ const ServerConfig& Server::select_config(const Request &req, const Client &c) c
     default_config.root = "./www";
     default_config.index = "index.html";
     return default_config;
+}
+
+RouteConfig Server::select_route(const Request &req, const ServerConfig &config) const {
+    RouteConfig best_match;
+    bool found = false;
+    size_t best_len = 0;
+    for (size_t i = 0; i < config.routes.size(); ++i) {
+        const RouteConfig &route = config.routes[i];
+        if (req.get_path().find(route.path) == 0 && route.path.size() >= best_len) {
+            best_match = route;
+            best_len = route.path.size();
+            found = true;
+        }
+    }
+    if (!found) {
+        best_match.path = "/";
+        best_match.autoindex_set = true;
+        best_match.autoindex = config.autoindex;
+        best_match.root = config.root;
+        best_match.index = config.index;
+        best_match.upload_dir = config.upload_dir;
+        best_match.allowed_methods = config.allowed_methods;
+        best_match.cgi_extensions = config.cgi_extensions;
+        best_match.max_body_size = config.max_body_size;
+        best_match.max_body_size_set = true;
+    } else {
+        if (!best_match.autoindex_set) {
+            best_match.autoindex = config.autoindex;
+            best_match.autoindex_set = true;
+        }
+        if (best_match.root.empty()) {
+            best_match.root = config.root;
+        }
+        if (best_match.index.empty()) {
+            best_match.index = config.index;
+        }
+        if (best_match.upload_dir.empty()) {
+            best_match.upload_dir = config.upload_dir;
+        }
+        if (best_match.allowed_methods.empty()) {
+            best_match.allowed_methods = config.allowed_methods;
+        }
+        if (best_match.cgi_extensions.empty()) {
+            best_match.cgi_extensions = config.cgi_extensions;
+        }
+        if (!best_match.max_body_size_set) {
+            best_match.max_body_size = config.max_body_size;
+            best_match.max_body_size_set = true;
+        }
+    }
+    return best_match;
+}
+
+bool Server::is_method_allowed(const std::string &method, const RouteConfig &route) const {
+    for (size_t i = 0; i < route.allowed_methods.size(); ++i) {
+        if (route.allowed_methods[i] == method) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Server::is_cgi_request(const std::string &path, const RouteConfig &route, const ServerConfig &config) const {
+    std::vector<std::string> extensions = route.cgi_extensions.empty() ? config.cgi_extensions : route.cgi_extensions;
+    if (extensions.empty()) {
+        return false;
+    }
+    size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos) {
+        return false;
+    }
+    std::string ext = path.substr(dot);
+    for (size_t i = 0; i < extensions.size(); ++i) {
+        if (extensions[i] == ext) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Server::apply_timeout_check() {
+    const time_t kClientTimeout = 30;
+    time_t now = time(NULL);
+    for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
+        Client *c = it->second;
+        if (c->state == STATE_DONE || c->state == STATE_ERROR || c->state == STATE_WRITING_RESPONSE) {
+            continue;
+        }
+        if (now - c->last_activity > kClientTimeout) {
+            Request req("GET / HTTP/1.1\r\n\r\n");
+            const ServerConfig &config = select_config(req, *c);
+            RouteConfig route = select_route(req, config);
+            Response res(408, "Request Timeout", config, route);
+            c->response_buffer = res.get_raw_response();
+            c->state = STATE_WRITING_RESPONSE;
+            update_poll_events(c->fd, POLLIN | POLLOUT);
+        }
+    }
 }

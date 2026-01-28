@@ -5,13 +5,22 @@
 #include <sstream>
 #include <sys/stat.h>
 
-Response::Response(const Request& req, const ServerConfig &config) : _content_type("text/html"), _config(config) {
-    std::string root = _config.root.empty() ? "./www" : _config.root;
-    std::string index = _config.index.empty() ? "index.html" : _config.index;
+Response::Response(const Request& req, const ServerConfig &config, const RouteConfig &route)
+    : _content_type("text/html"), _config(config), _route(route) {
+    std::string root = _route.root.empty() ? _config.root : _route.root;
+    std::string index = _route.index.empty() ? _config.index : _route.index;
+    bool autoindex = _route.autoindex_set ? _route.autoindex : _config.autoindex;
 
     // 1. Basic Method Validation
     if (req.get_method() != "GET" && req.get_method() != "DELETE") {
         _build_error_page(405, "Method Not Allowed");
+    } else if (_route.redirect_code != 0 && !_route.redirect_target.empty()) {
+        std::stringstream status;
+        status << "HTTP/1.1 " << _route.redirect_code << " Redirect\r\n";
+        _status_line = status.str();
+        _headers = "Location: " + _route.redirect_target + "\r\n";
+        _body.clear();
+        _content_type = "text/plain";
     } else if (req.get_method() == "DELETE") {
         std::string full_path = root + req.get_path();
         if (remove(full_path.c_str()) == 0) {
@@ -41,10 +50,12 @@ Response::Response(const Request& req, const ServerConfig &config) : _content_ty
                 _body = ss.str();
                 _content_type = _detect_content_type(index_path);
                 index_file.close();
-            } else {
+            } else if (autoindex) {
                 _status_line = "HTTP/1.1 200 OK\r\n";
                 _build_autoindex(full_path, request_path);
                 _content_type = "text/html";
+            } else {
+                _build_error_page(403, "Forbidden");
             }
         } else {
             // 3. Try to open the file
@@ -65,12 +76,26 @@ Response::Response(const Request& req, const ServerConfig &config) : _content_ty
     // 4. Assemble the final response
     std::stringstream res;
     res << _status_line;
+    res << _headers;
     res << "Content-Type: " << _content_type << "\r\n";
     res << "Content-Length: " << _body.size() << "\r\n";
     res << "Connection: close\r\n";
     res << "\r\n";
     res << _body;
 
+    _full_response = res.str();
+}
+
+Response::Response(int code, const std::string &message, const ServerConfig &config, const RouteConfig &route)
+    : _content_type("text/html"), _config(config), _route(route) {
+    _build_error_page(code, message);
+    std::stringstream res;
+    res << _status_line;
+    res << "Content-Type: " << _content_type << "\r\n";
+    res << "Content-Length: " << _body.size() << "\r\n";
+    res << "Connection: close\r\n";
+    res << "\r\n";
+    res << _body;
     _full_response = res.str();
 }
 

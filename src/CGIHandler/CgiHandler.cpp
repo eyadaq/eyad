@@ -12,8 +12,53 @@
 
 
 #include "CgiHandler.hpp"
+#include <cstdlib>
+#include <cstring>
+#include <sstream>
 
-#include "CgiHandler.hpp"
+CgiHandler::CgiHandler(const Request& req, std::string script_path)
+    : _script_path(script_path), _body(req.get_body()), _cgi_pid(-1) {
+    _init_env(req);
+}
+
+void CgiHandler::_init_env(const Request& req) {
+    std::string path = req.get_path();
+    std::string query;
+    size_t qpos = path.find('?');
+    if (qpos != std::string::npos) {
+        query = path.substr(qpos + 1);
+        path = path.substr(0, qpos);
+    }
+    _env["GATEWAY_INTERFACE"] = "CGI/1.1";
+    _env["REQUEST_METHOD"] = req.get_method();
+    _env["SCRIPT_FILENAME"] = _script_path;
+    _env["SCRIPT_NAME"] = path;
+    _env["QUERY_STRING"] = query;
+    _env["SERVER_PROTOCOL"] = "HTTP/1.1";
+    _env["REDIRECT_STATUS"] = "200";
+
+    std::string content_length = req.get_header("Content-Length");
+    if (!content_length.empty()) {
+        _env["CONTENT_LENGTH"] = content_length;
+    }
+    std::string content_type = req.get_header("Content-Type");
+    if (!content_type.empty()) {
+        _env["CONTENT_TYPE"] = content_type;
+    }
+}
+
+char** CgiHandler::_get_env_char() {
+    char** envp = new char*[_env.size() + 1];
+    size_t idx = 0;
+    for (std::map<std::string, std::string>::const_iterator it = _env.begin(); it != _env.end(); ++it) {
+        std::string entry = it->first + "=" + it->second;
+        char* data = new char[entry.size() + 1];
+        std::strcpy(data, entry.c_str());
+        envp[idx++] = data;
+    }
+    envp[idx] = NULL;
+    return envp;
+}
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
