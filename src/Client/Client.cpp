@@ -13,9 +13,16 @@
  
 #include "Client.hpp"
   
-Client::Client(int socket_fd) : 
-        fd(socket_fd), 
+Client::Client(int socket_fd, int listen_port) : 
+        fd(socket_fd),
+        listen_port(listen_port),
         cgi_pipe_fd(-1), 
         cgi_pid(-1), 
         state(STATE_READING_REQUEST),
-        last_activity(time(NULL)) {}
+        last_activity(time(NULL)),
+        header_parsed(false),
+        request_complete(false),
+        chunked(false),
+        content_length(0),
+        header_end(0),
+        chunk_parse_pos(0) {}

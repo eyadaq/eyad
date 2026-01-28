@@ -11,21 +11,34 @@
 /* ************************************************************************** */
 
 #include "Server.hpp"
+#include <cstdlib>
+
+volatile sig_atomic_t g_shutdown_requested = 0;
 
 Server::Server() {}
 
 Server::~Server() {
-    // Clean up all clients
+    cleanup();
+}
+
+void Server::set_configs(const std::vector<ServerConfig> &configs) {
+    _configs = configs;
+}
+
+void Server::cleanup() {
     for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
         close(it->first);
         delete it->second;
     }
     _clients.clear();
 
-    // Close listeners
     for (size_t i = 0; i < _listen_fds.size(); ++i) {
         close(_listen_fds[i]);
     }
+    _listen_fds.clear();
+    _poll_fds.clear();
+    _cgi_fds.clear();
+    _listener_ports.clear();
 }
 
 void Server::update_poll_events(int fd, short events) {
@@ -73,6 +86,7 @@ void Server::setup_server(int port) {
     pollfd pfd = {listen_fd, POLLIN, 0};
     _poll_fds.push_back(pfd);
     _listen_fds.push_back(listen_fd);
+    _listener_ports[listen_fd] = port;
     
     std::cout << "Server listening on port " << port << std::endl;
 }
@@ -88,7 +102,8 @@ void Server::accept_new_connection(int listen_fd) {
     fcntl(client_fd, F_SETFL, O_NONBLOCK);
 
     // Create our state-tracking object
-    _clients[client_fd] = new Client(client_fd);
+    int listen_port = _listener_ports.count(listen_fd) ? _listener_ports[listen_fd] : 0;
+    _clients[client_fd] = new Client(client_fd, listen_port);
 
     // Add to poll list
     pollfd pfd = {client_fd, POLLIN, 0};
@@ -115,17 +130,80 @@ void Server::handle_client_read(int fd, Client &c) {
     c.request_buffer.append(buffer, bytes_read);
     c.last_activity = time(NULL); // Reset timeout timer
 
-    // State Machine Logic
-    if (c.state == STATE_READING_REQUEST) {
-        // Check if we have finished reading the header
-        if (c.request_buffer.find("\r\n\r\n") != std::string::npos) {
-            std::cout << "Header fully received for FD " << fd << std::endl;
-            
-            // In a real Webserv, you'd parse the header here to see 
-            // if there is a Content-Length for a Body.
-            // For now, let's move straight to processing.
+    if (c.state != STATE_READING_REQUEST || c.request_complete) {
+        return;
+    }
+
+    if (!c.header_parsed) {
+        size_t header_end = c.request_buffer.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            return;
+        }
+        c.header_parsed = true;
+        c.header_end = header_end + 4;
+        c.chunk_parse_pos = c.header_end;
+
+        std::string header_part = c.request_buffer.substr(0, header_end);
+        std::stringstream ss(header_part);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (!line.empty() && line[line.size() - 1] == '\r') {
+                line.erase(line.size() - 1);
+            }
+            size_t colon_pos = line.find(':');
+            if (colon_pos == std::string::npos) {
+                continue;
+            }
+            std::string key = line.substr(0, colon_pos);
+            std::string value = line.substr(colon_pos + 1);
+            size_t first = value.find_first_not_of(' ');
+            if (first != std::string::npos) {
+                value = value.substr(first);
+            }
+            if (key == "Content-Length") {
+                c.content_length = static_cast<size_t>(std::strtoul(value.c_str(), NULL, 10));
+            }
+            if (key == "Transfer-Encoding" && value.find("chunked") != std::string::npos) {
+                c.chunked = true;
+            }
+        }
+    }
+
+    if (c.chunked) {
+        while (true) {
+            size_t line_end = c.request_buffer.find("\r\n", c.chunk_parse_pos);
+            if (line_end == std::string::npos) {
+                return;
+            }
+            std::string size_str = c.request_buffer.substr(c.chunk_parse_pos, line_end - c.chunk_parse_pos);
+            size_t semicolon = size_str.find(';');
+            if (semicolon != std::string::npos) {
+                size_str = size_str.substr(0, semicolon);
+            }
+            size_t chunk_size = static_cast<size_t>(std::strtoul(size_str.c_str(), NULL, 16));
+            size_t data_start = line_end + 2;
+            size_t data_end = data_start + chunk_size;
+            if (c.request_buffer.size() < data_end + 2) {
+                return;
+            }
+            if (chunk_size == 0) {
+                std::string header_part = c.request_buffer.substr(0, c.header_end);
+                c.request_buffer = header_part + c.decoded_body;
+                c.request_complete = true;
+                c.state = STATE_PROCESSING;
+                return;
+            }
+            c.decoded_body.append(c.request_buffer.substr(data_start, chunk_size));
+            c.chunk_parse_pos = data_end + 2;
+        }
+    } else if (c.content_length > 0) {
+        if (c.request_buffer.size() >= c.header_end + c.content_length) {
+            c.request_complete = true;
             c.state = STATE_PROCESSING;
         }
+    } else if (c.header_parsed) {
+        c.request_complete = true;
+        c.state = STATE_PROCESSING;
     }
 }
 
@@ -153,10 +231,12 @@ void Server::handle_client_write(int fd, Client &c) {
 
 void Server::process_request(Client &c) {
     Request req(c.request_buffer);
+    const ServerConfig &config = select_config(req, c);
 
     // CGI Handling
     if (req.get_path().find(".py") != std::string::npos) {
-        CgiHandler cgi(req, "./www" + req.get_path());
+        std::string root = config.root.empty() ? "./www" : config.root;
+        CgiHandler cgi(req, root + req.get_path());
         int pipe_fd = cgi.launch();
 
         if (pipe_fd != -1) {
@@ -172,7 +252,7 @@ void Server::process_request(Client &c) {
     }
 
     // Static Handling
-    Response res(req);
+    Response res(req, config);
     c.response_buffer = res.get_raw_response();
     c.state = STATE_WRITING_RESPONSE;
     
@@ -208,7 +288,7 @@ void Server::handle_cgi_read(int pipe_fd, size_t &poll_idx) {
 }
 
 void Server::run() {
-    while (true) {
+    while (!g_shutdown_requested) {
         int poll_count = poll(&_poll_fds[0], _poll_fds.size(), 1000);
         if (poll_count < 0) break;
 
@@ -252,5 +332,33 @@ void Server::run() {
         // The Zombie Killer
         waitpid(-1, NULL, WNOHANG);
     }
+    cleanup();
 }
 
+const ServerConfig& Server::select_config(const Request &req, const Client &c) const {
+    const ServerConfig *fallback = NULL;
+    std::string host = req.get_header("Host");
+    size_t colon = host.find(':');
+    if (colon != std::string::npos) {
+        host = host.substr(0, colon);
+    }
+
+    for (size_t i = 0; i < _configs.size(); ++i) {
+        if (_configs[i].port != c.listen_port) {
+            continue;
+        }
+        if (!fallback) {
+            fallback = &_configs[i];
+        }
+        if (!host.empty() && _configs[i].server_name == host) {
+            return _configs[i];
+        }
+    }
+    if (fallback) {
+        return *fallback;
+    }
+    static ServerConfig default_config;
+    default_config.root = "./www";
+    default_config.index = "index.html";
+    return default_config;
+}

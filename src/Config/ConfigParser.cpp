@@ -38,6 +38,13 @@ std::vector<ServerConfig> ConfigParser::parse(const std::string& path) {
 		else if (key == "server_name") ss >> current_config.server_name;
 		else if (key == "root") ss >> current_config.root;
 		else if (key == "index") ss >> current_config.index;
+		else if (key == "error_page") {
+			int code;
+			std::string path_value;
+			if (ss >> code >> path_value) {
+				current_config.error_pages[code] = path_value;
+			}
+		}
 		else if (key == "server") { /* Start of a new block logic */ }
 		// Add a ';' check if your config format requires it
 	}

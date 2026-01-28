@@ -30,16 +30,23 @@ enum e_state {
 class Client {
 public:
     int             fd;
+    int             listen_port;
     int             cgi_pipe_fd;   // Read-end of the pipe from the CGI child
     pid_t           cgi_pid;       // Child process ID for waitpid()
     e_state         state;
     std::string     request_buffer;
     std::string     response_buffer;
     time_t          last_activity; // For handling timeouts
+    bool            header_parsed;
+    bool            request_complete;
+    bool            chunked;
+    size_t          content_length;
+    size_t          header_end;
+    size_t          chunk_parse_pos;
+    std::string     decoded_body;
 
     // Constructor to initialize everything to safe defaults
-    Client(int socket_fd);
+    Client(int socket_fd, int listen_port);
 };
 
 #endif
-

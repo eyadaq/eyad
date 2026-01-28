@@ -15,6 +15,7 @@
 
 #include <string>
 #include "Request.hpp"
+#include "Config.hpp"
 
 class Response {
 private:
@@ -22,12 +23,16 @@ private:
     std::string _body;
     std::string _status_line;
     std::string _headers;
+    std::string _content_type;
+    ServerConfig _config;
 
-    void _build_error_page(std::string code, std::string message);
-    void _file_to_body(std::string path);
+    void _build_error_page(int code, const std::string &message);
+    void _build_autoindex(const std::string &full_path, const std::string &request_path);
+    std::string _detect_content_type(const std::string &path) const;
+    bool _try_load_error_page(int code);
 
 public:
-    Response(const Request& req);
+    Response(const Request& req, const ServerConfig &config);
     ~Response() {}
 
     const std::string& get_raw_response() const { return _full_response; }
